@@ -1,0 +1,19 @@
+# Install: copy to /etc/systemd/system/sf-pi-worker.service, edit User/paths,
+# then: sudo systemctl daemon-reload && sudo systemctl enable --now sf-pi-worker
+[Unit]
+Description=sf-agent home worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/sf-pi-worker
+# Secrets live in an env file (chmod 600). See .env.example for the keys.
+EnvironmentFile=/home/pi/sf-pi-worker/.env
+ExecStart=/home/pi/.bun/bin/bun src/index.ts
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

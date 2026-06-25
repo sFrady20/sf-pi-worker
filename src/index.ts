@@ -32,34 +32,40 @@ function send(res: ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
+// Lighting mutations are fire-and-forget: we ack immediately and apply to the
+// bulbs in the background. A wedged LIFX socket can then never hang the agent.
+const bg = (p: Promise<unknown>) => void p.catch((e) => console.warn("[lighting]", (e as Error).message));
+
 async function handleLighting(req: IncomingMessage, res: ServerResponse, path: string): Promise<void> {
   if (!lighting) return send(res, 503, { error: "lighting unavailable" });
   if (req.method === "GET" && path === "/lighting") return send(res, 200, lighting.status());
+  const l = lighting;
   const body = await readJson(req);
   switch (path) {
     case "/lighting/scene":
-      await lighting.applyScene(body.scene as "morning" | "day" | "evening" | "night");
+      bg(l.applyScene(body.scene as "morning" | "day" | "evening" | "night"));
       return send(res, 200, { ok: true });
     case "/lighting/theme":
-      await lighting.setTheme(body as ThemeInput);
+      bg(l.setTheme(body as ThemeInput));
       return send(res, 200, { ok: true });
     case "/lighting/auto":
-      await lighting.resumeAuto();
+      bg(l.resumeAuto());
       return send(res, 200, { ok: true });
     case "/lighting/scene-look":
-      await lighting.setSceneLook(body as unknown as SceneLookInput);
+      bg(l.setSceneLook(body as unknown as SceneLookInput));
       return send(res, 200, { ok: true });
     case "/lighting/power":
-      await lighting.setAllPower(Boolean(body.on));
+      bg(l.setAllPower(Boolean(body.on)));
       return send(res, 200, { ok: true });
     case "/lighting/enable":
-      await lighting.setEnabled(Boolean(body.enabled));
+      bg(l.setEnabled(Boolean(body.enabled)));
       return send(res, 200, { ok: true });
     case "/lighting/flash":
-      await lighting.flash(typeof body.times === "number" ? body.times : 2);
+      bg(l.flash(typeof body.times === "number" ? body.times : 2));
       return send(res, 200, { ok: true });
     case "/lighting/tune":
-      return send(res, 200, { ok: true, taste: await lighting.tune(body as TastePatch) });
+      bg(l.tune(body as TastePatch));
+      return send(res, 200, { ok: true });
     default:
       return send(res, 404, { error: "not found" });
   }

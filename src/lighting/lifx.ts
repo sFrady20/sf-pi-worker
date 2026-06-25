@@ -1,5 +1,6 @@
 // Thin async adapter over the LIFX LAN library. All library specifics live here,
 // so the daemon stays library-agnostic. HSBK: hue 0-360, sat/bri 0-100, kelvin.
+// Every call has a hard timeout — a wedged UDP socket must never hang a caller.
 import { Client, type LifxLight } from "lifx-lan-client";
 
 export interface LightState {
@@ -12,6 +13,24 @@ export interface LightState {
 export interface LightInfo {
   id: string;
   label: string;
+}
+
+const OP_TIMEOUT = Number(process.env.LIFX_OP_TIMEOUT_MS ?? 4000);
+
+function withTimeout<T>(p: Promise<T>, what: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error(`lifx ${what} timed out`)), OP_TIMEOUT);
+    p.then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      },
+    );
+  });
 }
 
 export class Lifx {
@@ -54,19 +73,22 @@ export class Lifx {
 
   getState(id: string): Promise<LightState> {
     const light = this.#light(id);
-    return new Promise((resolve, reject) => {
-      light.getState((err, info) => {
-        if (err) return reject(err);
-        this.#labels.set(id, info.label);
-        resolve({
-          power: info.power > 0,
-          hue: info.color.hue,
-          saturation: info.color.saturation,
-          brightness: info.color.brightness,
-          kelvin: info.color.kelvin,
+    return withTimeout(
+      new Promise<LightState>((resolve, reject) => {
+        light.getState((err, info) => {
+          if (err) return reject(err);
+          this.#labels.set(id, info.label);
+          resolve({
+            power: info.power > 0,
+            hue: info.color.hue,
+            saturation: info.color.saturation,
+            brightness: info.color.brightness,
+            kelvin: info.color.kelvin,
+          });
         });
-      });
-    });
+      }),
+      "getState",
+    );
   }
 
   setColor(
@@ -75,19 +97,25 @@ export class Lifx {
     durationMs = 1000,
   ): Promise<void> {
     const light = this.#light(id);
-    return new Promise((resolve, reject) => {
-      light.color(c.hue, c.saturation, c.brightness, c.kelvin, durationMs, (err) =>
-        err ? reject(err) : resolve(),
-      );
-    });
+    return withTimeout(
+      new Promise<void>((resolve, reject) => {
+        light.color(c.hue, c.saturation, c.brightness, c.kelvin, durationMs, (err) =>
+          err ? reject(err) : resolve(),
+        );
+      }),
+      "setColor",
+    );
   }
 
   setPower(id: string, on: boolean, durationMs = 1000): Promise<void> {
     const light = this.#light(id);
-    return new Promise((resolve, reject) => {
-      const cb = (err: Error | null) => (err ? reject(err) : resolve());
-      if (on) light.on(durationMs, cb);
-      else light.off(durationMs, cb);
-    });
+    return withTimeout(
+      new Promise<void>((resolve, reject) => {
+        const cb = (err: Error | null) => (err ? reject(err) : resolve());
+        if (on) light.on(durationMs, cb);
+        else light.off(durationMs, cb);
+      }),
+      "setPower",
+    );
   }
 }

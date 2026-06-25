@@ -110,13 +110,13 @@ async function tick(): Promise<void> {
     if (sceneChanged && scene.authoritative) {
       own.owned = true;
       if (scene.power === "off" && state.power) {
-        await lifx.setPower(id, false, config.transitionMs);
+        await lifx.setPower(id, false, config.transitionMs).catch(() => {});
         ownership.set(id, { commanded: { ...state, power: false }, owned: true });
         index++;
         continue;
       }
       if (scene.power === "on" && !state.power) {
-        await lifx.setPower(id, true, config.transitionMs);
+        await lifx.setPower(id, true, config.transitionMs).catch(() => {});
         state.power = true;
       }
     }
@@ -131,8 +131,12 @@ async function tick(): Promise<void> {
     const base = targetFor(look, index);
     const target: LightState = { ...base, brightness: Math.round(clamp(base.brightness * scale, 1, 100)) };
     if (!own.commanded || !matches(target, own.commanded) || look.drift) {
-      await lifx.setColor(id, target, config.transitionMs);
-      own.commanded = target;
+      try {
+        await lifx.setColor(id, target, config.transitionMs);
+        own.commanded = target;
+      } catch (e) {
+        console.warn("[lighting] setColor failed:", (e as Error).message);
+      }
     }
     ownership.set(id, own);
     index++;

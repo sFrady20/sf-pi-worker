@@ -199,7 +199,9 @@ export async function setTheme(input: ThemeInput): Promise<void> {
     brightness: input.brightness ?? 45,
     drift: input.drift ?? true,
   };
-  currentScene = "_held"; // suppress an immediate authoritative reclaim
+  // Align with the clock so this tick isn't seen as a scene boundary — otherwise
+  // an authoritative scene would immediately clear the theme we just set.
+  currentScene = sceneNow(config).name;
   await setAllPower(true);
   await tick();
 }
@@ -207,6 +209,27 @@ export async function setTheme(input: ThemeInput): Promise<void> {
 export async function applyScene(name: Scene["name"]): Promise<void> {
   const scene = config.scenes.find((s) => s.name === name);
   if (scene) await setTheme(lookOf(scene));
+}
+
+export interface SceneLookInput extends ThemeInput {
+  scene: Scene["name"];
+}
+
+// Redefine what a scheduled scene looks like (the "auto" theme for that window),
+// persisted to the taste config so it sticks going forward.
+export async function setSceneLook(input: SceneLookInput): Promise<void> {
+  const scene = config.scenes.find((s) => s.name === input.scene);
+  if (!scene) return;
+  if (input.palette) scene.palette = input.palette;
+  if (input.brightness !== undefined) scene.brightness = input.brightness;
+  if (input.white !== undefined) scene.color = !input.white;
+  if (input.kelvin !== undefined) scene.kelvin = input.kelvin;
+  if (input.drift !== undefined) scene.drift = input.drift;
+  await saveConfig(config);
+  if (!heldTheme && currentScene === input.scene) {
+    currentScene = null; // re-apply the updated look now
+    await tick();
+  }
 }
 
 export async function resumeAuto(): Promise<void> {

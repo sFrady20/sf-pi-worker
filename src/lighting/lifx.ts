@@ -20,13 +20,26 @@ export class Lifx {
   #labels = new Map<string, string>();
 
   start(): void {
-    this.#client.on("light-new", (light) => {
+    this.#client.on("error", (err: Error) => {
+      console.warn("[lifx] client error:", err?.message ?? err);
+    });
+    this.#client.on("light-new", (light: LifxLight) => {
       this.#byId.set(light.id, light);
       light.getState((err, info) => {
         if (!err) this.#labels.set(light.id, info.label);
       });
     });
-    this.#client.init();
+    // Tailscale (or any extra interface) can hijack UDP broadcast discovery, which
+    // shows up as "stopped sending due to unbound socket" + high CPU. Bind LIFX to
+    // the LAN: set LIFX_ADDRESS to the Pi's LAN IP and LIFX_BROADCAST to the subnet
+    // broadcast. LIFX_LIGHTS (comma IPs) skips broadcast discovery entirely.
+    const lights = process.env.LIFX_LIGHTS?.split(",").map((s) => s.trim()).filter(Boolean);
+    this.#client.init({
+      address: process.env.LIFX_ADDRESS ?? "0.0.0.0",
+      broadcast: process.env.LIFX_BROADCAST ?? "255.255.255.255",
+      lightOfflineTolerance: 3,
+      ...(lights && lights.length ? { lights } : {}),
+    });
   }
 
   list(): LightInfo[] {

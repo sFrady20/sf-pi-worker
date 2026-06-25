@@ -28,6 +28,6 @@ declare module "lifx-lan-client" {
   export class Client {
     init(opts?: Record<string, unknown>): void;
     lights(status?: string): LifxLight[];
-    on(event: string, handler: (light: LifxLight) => void): void;
+    on(event: string, handler: (arg: any) => void): void;
   }
 }

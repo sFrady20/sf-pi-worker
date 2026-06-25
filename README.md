@@ -109,6 +109,27 @@ your subnet broadcast (e.g. `192.168.1.255`). If it persists, set `LIFX_LIGHTS` 
 your bulbs' IPs to skip broadcast discovery, or run the worker under `node` instead
 of `bun`.
 
+## Presence ("am I home?")
+
+Watches one phone's MAC on the LAN with `ip monitor neigh` (event-driven, no
+polling) and fires a home/away transition:
+
+- **Arrivals are instant.** Departures are debounced — phones sleep WiFi, so it
+  waits `PRESENCE_AWAY_GRACE_SECONDS` and pings before declaring you away.
+- On a transition it fires any pending presence reminders to Telegram and POSTs to
+  the agent (`AGENT_PRESENCE_URL`) so it records your home/away status.
+- Set `PRESENCE_MAC` to your phone's MAC on the home network — **disable MAC
+  randomization for that network** so it's stable.
+
+Register a presence reminder (the agent's `remind_when` tool does this):
+
+```json
+POST /jobs  { "type": "presence", "message": "take out the trash", "trigger": "home" }
+```
+
+`ip monitor neigh` and `ping` run without root. If your distro restricts the
+neighbor table, grant the service `CAP_NET_ADMIN`.
+
 ## Local development
 
 ```bash

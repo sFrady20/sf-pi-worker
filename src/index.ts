@@ -5,6 +5,8 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { loadAndArm, scheduleReminder } from "./jobs.js";
 import type { SceneLookInput, TastePatch, ThemeInput } from "./lighting/daemon.js";
+import { startPresence } from "./presence/monitor.js";
+import { addPresenceReminder, firePresence, loadPresenceReminders, type Presence } from "./presence/reminders.js";
 
 const PORT = Number(process.env.PORT ?? 8088);
 const SECRET = process.env.WORKER_SECRET;
@@ -71,17 +73,17 @@ const server = createServer(async (req, res) => {
     if (path === "/jobs" && req.method === "POST") {
       if (!authorized(req)) return send(res, 401, { error: "unauthorized" });
       const body = await readJson(req);
-      if (
-        body.type !== "reminder" ||
-        typeof body.message !== "string" ||
-        typeof body.delaySeconds !== "number"
-      ) {
-        return send(res, 400, {
-          error: "Expected { type: 'reminder', message: string, delaySeconds: number }",
-        });
+      if (body.type === "reminder" && typeof body.message === "string" && typeof body.delaySeconds === "number") {
+        const job = await scheduleReminder(body.message, body.delaySeconds);
+        return send(res, 200, { id: job.id, fireAt: new Date(job.fireAt).toISOString() });
       }
-      const job = await scheduleReminder(body.message, body.delaySeconds);
-      return send(res, 200, { id: job.id, fireAt: new Date(job.fireAt).toISOString() });
+      if (body.type === "presence" && typeof body.message === "string" && (body.trigger === "home" || body.trigger === "away")) {
+        const r = await addPresenceReminder(body.message, body.trigger as Presence);
+        return send(res, 200, { id: r.id, trigger: r.trigger });
+      }
+      return send(res, 400, {
+        error: "Expected a reminder {message,delaySeconds} or presence {message,trigger:'home'|'away'} job",
+      });
     }
 
     if (path.startsWith("/lighting")) {
@@ -96,7 +98,25 @@ const server = createServer(async (req, res) => {
   }
 });
 
+async function notifyAgentPresence(state: Presence): Promise<void> {
+  const url = process.env.AGENT_PRESENCE_URL;
+  const secret = process.env.PRESENCE_AGENT_SECRET;
+  if (!url || !secret) return;
+  await fetch(url, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${secret}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ state, at: new Date().toISOString() }),
+  });
+}
+
 await loadAndArm();
+await loadPresenceReminders();
+await startPresence(async (state) => {
+  console.log("[presence]", state);
+  await firePresence(state);
+  await notifyAgentPresence(state).catch((e) => console.warn("[presence] agent notify failed", e));
+});
+
 server.listen(PORT, () => {
   console.log(`[worker] listening on :${PORT}`);
   void (async () => {

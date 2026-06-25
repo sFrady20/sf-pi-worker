@@ -8,6 +8,9 @@
     "start": "bun src/index.ts",
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "lifx-lan-client": "^1.0.0"
+  },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "typescript": "^5.6.0"

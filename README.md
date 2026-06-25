@@ -67,6 +67,36 @@ sudo systemctl daemon-reload && sudo systemctl enable --now sf-pi-worker
    curl https://<pi>.<tailnet>.ts.net/health
    ```
 
+## Mood lighting (LIFX)
+
+An optional cooperative lighting daemon (`src/lighting/`) that makes the lab feel
+alive without fighting you. It controls LIFX bulbs over the LAN.
+
+- **Time-of-day scenes** (morning / day / evening / night). Morning and evening are
+  *authoritative* — they may turn lights on/off and reclaim bulbs you'd changed by
+  hand. Daytime is cooperative.
+- **Cooperative ownership.** It tracks what it set each bulb to; if you change one
+  by hand it backs off that bulb until the next authoritative scene.
+- **Gentle drift.** Owned color bulbs wander hue slowly, skipping avoided colors.
+- **Taste** lives in `data/lighting.json` (auto-created): `avoidHueRanges` (red by
+  default), `perLight` brightness multipliers / exclusions, drift speed, and the
+  scene schedule. Edit it directly or via the API.
+
+It's optional — the worker runs reminders without it. Enable by installing the LAN
+library:
+
+```bash
+bun add lifx-lan-client
+```
+
+Endpoints (all bearer-authed): `GET /lighting` · `POST /lighting/scene {scene}` ·
+`POST /lighting/power {on}` · `POST /lighting/flash` · `POST /lighting/enable {enabled}` ·
+`POST /lighting/tune {light?,brightnessScale?,exclude?,avoidRed?}`.
+
+> `src/lighting/lifx.ts` wraps the LAN library — verify its calls against your
+> installed `lifx-lan-client` version, and add per-light tuning once you see your
+> bulbs' labels in `GET /lighting`.
+
 ## Local development
 
 ```bash

@@ -72,9 +72,13 @@ sudo systemctl daemon-reload && sudo systemctl enable --now sf-pi-worker
 An optional cooperative lighting daemon (`src/lighting/`) that makes the lab feel
 alive without fighting you. It controls LIFX bulbs over the LAN.
 
-- **Time-of-day scenes** (morning / day / evening / night). Morning and evening are
-  *authoritative* — they may turn lights on/off and reclaim bulbs you'd changed by
-  hand. Daytime is cooperative.
+- **Time-of-day scenes** (morning / day / evening / night), all color-first; night
+  is a dim calming indigo, not off. Morning and evening are *authoritative* — they
+  may turn lights on/off and reclaim bulbs you'd changed by hand. Daytime is
+  cooperative.
+- **Held themes.** An explicit theme (designed by the agent, or a named scene
+  applied on demand) *holds* — the schedule won't revert it — until you resume auto,
+  change a bulb by hand, or the next authoritative time-window.
 - **Cooperative ownership.** It tracks what it set each bulb to; if you change one
   by hand it backs off that bulb until the next authoritative scene.
 - **Gentle drift.** Owned color bulbs wander hue slowly, skipping avoided colors.
@@ -89,9 +93,10 @@ library:
 bun add lifx-lan-client
 ```
 
-Endpoints (all bearer-authed): `GET /lighting` · `POST /lighting/scene {scene}` ·
-`POST /lighting/power {on}` · `POST /lighting/flash` · `POST /lighting/enable {enabled}` ·
-`POST /lighting/tune {light?,brightnessScale?,exclude?,avoidRed?}`.
+Endpoints (all bearer-authed): `GET /lighting` ·
+`POST /lighting/theme {palette,brightness,drift,white?}` · `POST /lighting/auto` ·
+`POST /lighting/scene {scene}` · `POST /lighting/power {on}` · `POST /lighting/flash` ·
+`POST /lighting/enable {enabled}` · `POST /lighting/tune {light?,brightnessScale?,exclude?,avoidRed?}`.
 
 > `src/lighting/lifx.ts` wraps the LAN library — verify its calls against your
 > installed `lifx-lan-client` version, and add per-light tuning once you see your

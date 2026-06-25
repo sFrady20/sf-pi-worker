@@ -4,7 +4,7 @@
 
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { loadAndArm, scheduleReminder } from "./jobs.js";
-import type { TastePatch } from "./lighting/daemon.js";
+import type { TastePatch, ThemeInput } from "./lighting/daemon.js";
 
 const PORT = Number(process.env.PORT ?? 8088);
 const SECRET = process.env.WORKER_SECRET;
@@ -37,6 +37,12 @@ async function handleLighting(req: IncomingMessage, res: ServerResponse, path: s
   switch (path) {
     case "/lighting/scene":
       await lighting.applyScene(body.scene as "morning" | "day" | "evening" | "night");
+      return send(res, 200, { ok: true });
+    case "/lighting/theme":
+      await lighting.setTheme(body as ThemeInput);
+      return send(res, 200, { ok: true });
+    case "/lighting/auto":
+      await lighting.resumeAuto();
       return send(res, 200, { ok: true });
     case "/lighting/power":
       await lighting.setAllPower(Boolean(body.on));

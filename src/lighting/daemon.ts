@@ -1,22 +1,32 @@
-// The cooperative ambient-lighting loop. It only ever drives bulbs it "owns";
-// a manual change releases that bulb until the next authoritative scene change.
-import { loadConfig, saveConfig, type Scene, type TasteConfig } from "./config.js";
+// Cooperative ambient-lighting loop.
+//
+// Two sources of truth, in priority order:
+//   1. heldTheme  — an explicit look set by the agent ("a calming coding theme"),
+//                   or a named scene applied on demand. It HOLDS (no revert) until
+//                   cleared (resumeAuto), a manual physical override, or the next
+//                   authoritative time-scene boundary.
+//   2. the time-of-day scene — the autonomous default when nothing is held.
+//
+// It only drives bulbs it "owns": change one by hand and it backs off until an
+// authoritative scene reclaims it. Color-first; white only when a look asks for it.
+import { type Color, loadConfig, type Look, type Scene, saveConfig, type TasteConfig } from "./config.js";
 import { Lifx, type LightState } from "./lifx.js";
 
-const RED = [
+const RED: [number, number][] = [
   [345, 360],
   [0, 15],
-] as [number, number][];
+];
 
 let lifx: Lifx | null = null;
 let config: TasteConfig = await loadConfig();
+let heldTheme: Look | null = null;
 let currentScene: string | null = null;
-let loop: ReturnType<typeof setInterval> | null = null;
 const ownership = new Map<string, { commanded: LightState | null; owned: boolean }>();
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
 const wrapHue = (h: number) => ((h % 360) + 360) % 360;
+const circDelta = (a: number, b: number) => ((b - a + 540) % 360) - 180;
 
 function hourInTz(tz: string): number {
   const v = new Intl.DateTimeFormat("en-US", { timeZone: tz, hour: "numeric", hour12: false })
@@ -42,13 +52,33 @@ function sceneNow(cfg: TasteConfig): Scene {
   return pick;
 }
 
-// "Close enough" that we still consider the bulb under our control.
+function lookOf(scene: Scene): Look {
+  return { color: scene.color, palette: scene.palette, kelvin: scene.kelvin, brightness: scene.brightness, drift: scene.drift };
+}
+
+// The target color for one bulb, given the active look. Bulbs are spread across
+// the palette and (if drift) cycle through it over driftPeriodMinutes.
+function targetFor(look: Look, index: number): LightState {
+  if (!look.color || look.palette.length === 0) {
+    return { power: true, hue: 0, saturation: 0, brightness: look.brightness, kelvin: look.kelvin };
+  }
+  const n = look.palette.length;
+  const period = Math.max(1, config.driftPeriodMinutes) * 60_000;
+  const t = look.drift ? (Date.now() % period) / period : 0;
+  const pos = ((t + index / n) % 1) * n;
+  const i = Math.floor(pos) % n;
+  const a = look.palette[i];
+  const b = look.palette[(i + 1) % n];
+  const f = pos - Math.floor(pos);
+  const hue = nudgeToAllowed(wrapHue(a.hue + circDelta(a.hue, b.hue) * f), config.avoidHueRanges);
+  const saturation = a.saturation + (b.saturation - a.saturation) * f;
+  return { power: true, hue, saturation, brightness: look.brightness, kelvin: look.kelvin };
+}
+
 function matches(a: LightState, b: LightState): boolean {
   if (a.power !== b.power) return false;
   if (Math.abs(a.brightness - b.brightness) > 6) return false;
-  if (a.saturation > 5 && Math.abs(wrapHue(a.hue - b.hue)) > 12 && Math.abs(wrapHue(b.hue - a.hue)) > 12) {
-    return false;
-  }
+  if (a.saturation > 5 && Math.abs(circDelta(a.hue, b.hue)) > 12) return false;
   return true;
 }
 
@@ -56,29 +86,33 @@ async function tick(): Promise<void> {
   if (!lifx || !config.enabled) return;
   const scene = sceneNow(config);
   const sceneChanged = scene.name !== currentScene;
-  const step = (360 * config.pollSeconds) / (config.driftPeriodMinutes * 60); // degrees per tick
+  if (sceneChanged && scene.authoritative) heldTheme = null; // a real time-window takes over
+  const look = heldTheme ?? lookOf(scene);
 
+  let index = 0;
   for (const { id, label } of lifx.list()) {
     const per = config.perLight[label] ?? {};
-    if (per.exclude) continue;
+    if (per.exclude) {
+      index++;
+      continue;
+    }
     const own = ownership.get(id) ?? { commanded: null, owned: true };
-
     let state: LightState;
     try {
       state = await lifx.getState(id);
     } catch {
+      index++;
       continue;
     }
 
-    // Manual override? If reality drifted from what we last set, hands off.
-    if (own.commanded && !matches(state, own.commanded)) own.owned = false;
+    if (own.commanded && !matches(state, own.commanded)) own.owned = false; // manual override
 
-    // Authoritative scene boundary: reclaim and set power.
     if (sceneChanged && scene.authoritative) {
       own.owned = true;
       if (scene.power === "off" && state.power) {
         await lifx.setPower(id, false, config.transitionMs);
         ownership.set(id, { commanded: { ...state, power: false }, owned: true });
+        index++;
         continue;
       }
       if (scene.power === "on" && !state.power) {
@@ -87,29 +121,21 @@ async function tick(): Promise<void> {
       }
     }
 
-    // Cooperative: never touch released bulbs or ones that are off.
     if (!own.owned || !state.power) {
       ownership.set(id, own);
+      index++;
       continue;
     }
 
     const scale = (per.brightnessScale ?? 1) * config.defaultBrightnessScale;
-    const brightness = Math.round(clamp(scene.brightness * scale, 1, 100));
-    const target: LightState = scene.color
-      ? {
-          power: true,
-          hue: nudgeToAllowed((own.commanded?.hue ?? scene.startHour * 20) + step, config.avoidHueRanges),
-          saturation: config.saturation,
-          brightness,
-          kelvin: scene.kelvin,
-        }
-      : { power: true, hue: 0, saturation: 0, brightness, kelvin: scene.kelvin };
-
-    if (!own.commanded || !matches(target, own.commanded) || scene.color) {
+    const base = targetFor(look, index);
+    const target: LightState = { ...base, brightness: Math.round(clamp(base.brightness * scale, 1, 100)) };
+    if (!own.commanded || !matches(target, own.commanded) || look.drift) {
       await lifx.setColor(id, target, config.transitionMs);
       own.commanded = target;
     }
     ownership.set(id, own);
+    index++;
   }
   currentScene = scene.name;
 }
@@ -120,13 +146,14 @@ export async function startLighting(): Promise<void> {
   lifx.start();
   await sleep(4000); // let LAN discovery settle
   await tick();
-  loop = setInterval(() => void tick(), config.pollSeconds * 1000);
+  setInterval(() => void tick(), config.pollSeconds * 1000);
   console.log("[lighting] started");
 }
 
 export function status(): unknown {
   return {
     enabled: config.enabled,
+    held: heldTheme ? "custom theme" : null,
     scene: currentScene,
     lights: lifx?.list().map((l) => ({ ...l, owned: ownership.get(l.id)?.owned ?? true })) ?? [],
     taste: config,
@@ -136,13 +163,7 @@ export function status(): unknown {
 export async function setEnabled(enabled: boolean): Promise<void> {
   config.enabled = enabled;
   await saveConfig(config);
-}
-
-export async function applyScene(name: Scene["name"]): Promise<void> {
-  currentScene = null; // force an authoritative boundary on the next tick
-  const scene = config.scenes.find((s) => s.name === name);
-  if (scene) scene.authoritative = true;
-  await tick();
+  if (enabled) await tick();
 }
 
 export async function setAllPower(on: boolean): Promise<void> {
@@ -160,9 +181,42 @@ export async function setAllPower(on: boolean): Promise<void> {
   }
 }
 
+export interface ThemeInput {
+  palette?: Color[];
+  brightness?: number;
+  drift?: boolean;
+  white?: boolean;
+  kelvin?: number;
+}
+
+// Hold an explicit look (designed by the agent or from a named scene). Turns the
+// lights on so it's visible, and keeps it until cleared / overridden by hand.
+export async function setTheme(input: ThemeInput): Promise<void> {
+  heldTheme = {
+    color: !input.white,
+    palette: input.palette ?? [],
+    kelvin: input.kelvin ?? 2700,
+    brightness: input.brightness ?? 45,
+    drift: input.drift ?? true,
+  };
+  currentScene = "_held"; // suppress an immediate authoritative reclaim
+  await setAllPower(true);
+  await tick();
+}
+
+export async function applyScene(name: Scene["name"]): Promise<void> {
+  const scene = config.scenes.find((s) => s.name === name);
+  if (scene) await setTheme(lookOf(scene));
+}
+
+export async function resumeAuto(): Promise<void> {
+  heldTheme = null;
+  currentScene = null; // re-evaluate the time scene next tick
+  await tick();
+}
+
 export async function flash(times = 2): Promise<void> {
   if (!lifx) return;
-  // Notification pulse. Uses a non-red hue to respect taste.
   const pulse = { hue: 210, saturation: 80, brightness: 100, kelvin: 3500 };
   for (const { id } of lifx.list()) {
     const before = await lifx.getState(id).catch(() => null);
@@ -180,7 +234,6 @@ export interface TastePatch {
   brightnessScale?: number;
   exclude?: boolean;
   avoidRed?: boolean;
-  driftEnabled?: boolean;
 }
 
 export async function tune(patch: TastePatch): Promise<TasteConfig> {
@@ -192,7 +245,6 @@ export async function tune(patch: TastePatch): Promise<TasteConfig> {
   } else if (patch.brightnessScale !== undefined) {
     config.defaultBrightnessScale = patch.brightnessScale;
   }
-  if (patch.driftEnabled !== undefined) config.driftEnabled = patch.driftEnabled;
   if (patch.avoidRed !== undefined) {
     const hasRed = config.avoidHueRanges.some(([a]) => a === RED[0][0]);
     if (patch.avoidRed && !hasRed) config.avoidHueRanges.push(...RED);

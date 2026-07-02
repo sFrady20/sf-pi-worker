@@ -29,5 +29,6 @@ declare module "lifx-lan-client" {
     init(opts?: Record<string, unknown>): void;
     lights(status?: string): LifxLight[];
     on(event: string, handler: (arg: any) => void): void;
+    destroy(): void;
   }
 }

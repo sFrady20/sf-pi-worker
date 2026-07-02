@@ -33,16 +33,32 @@ function withTimeout<T>(p: Promise<T>, what: string): Promise<T> {
   });
 }
 
+const RESTART_BASE_MS = 2000;
+const RESTART_MAX_MS = 60_000;
+
 export class Lifx {
   #client = new Client();
   #byId = new Map<string, LifxLight>();
   #labels = new Map<string, string>();
+  #restartTimer: ReturnType<typeof setTimeout> | null = null;
+  #restartDelayMs = RESTART_BASE_MS;
 
   start(): void {
-    this.#client.on("error", (err: Error) => {
+    this.#init();
+  }
+
+  // Any UDP error (a route flap, a Wi-Fi drop) makes the library close its socket
+  // for good — it never rebinds, and every later send logs "stopped sending due to
+  // unbound socket". The only recovery is a fresh client, so rebuild on error.
+  #init(): void {
+    const client = new Client();
+    this.#client = client;
+    client.on("error", (err: Error) => {
       console.warn("[lifx] client error:", err?.message ?? err);
+      this.#scheduleRestart();
     });
-    this.#client.on("light-new", (light: LifxLight) => {
+    client.on("light-new", (light: LifxLight) => {
+      this.#restartDelayMs = RESTART_BASE_MS; // discovery works — reset backoff
       this.#byId.set(light.id, light);
       light.getState((err, info) => {
         if (!err) this.#labels.set(light.id, info.label);
@@ -53,12 +69,28 @@ export class Lifx {
     // the LAN: set LIFX_ADDRESS to the Pi's LAN IP and LIFX_BROADCAST to the subnet
     // broadcast. LIFX_LIGHTS (comma IPs) skips broadcast discovery entirely.
     const lights = process.env.LIFX_LIGHTS?.split(",").map((s) => s.trim()).filter(Boolean);
-    this.#client.init({
+    client.init({
       address: process.env.LIFX_ADDRESS ?? "0.0.0.0",
       broadcast: process.env.LIFX_BROADCAST ?? "255.255.255.255",
       lightOfflineTolerance: 3,
       ...(lights && lights.length ? { lights } : {}),
     });
+  }
+
+  #scheduleRestart(): void {
+    if (this.#restartTimer) return;
+    console.warn(`[lifx] restarting client in ${this.#restartDelayMs}ms`);
+    this.#restartTimer = setTimeout(() => {
+      this.#restartTimer = null;
+      this.#restartDelayMs = Math.min(this.#restartDelayMs * 2, RESTART_MAX_MS);
+      try {
+        this.#client.destroy(); // stops discovery + send timers; socket is already closed
+      } catch (e) {
+        console.warn("[lifx] destroy failed:", (e as Error).message);
+      }
+      this.#byId.clear(); // stale handles hold the dead socket; rediscovery repopulates
+      this.#init();
+    }, this.#restartDelayMs);
   }
 
   list(): LightInfo[] {

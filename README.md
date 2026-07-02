@@ -103,11 +103,13 @@ Endpoints (all bearer-authed): `GET /lighting` ·
 > bulbs' labels in `GET /lighting`.
 
 **Discovery troubleshooting.** `LIFX Client stopped sending due to unbound socket`
-(often with high CPU) means UDP broadcast discovery is leaving the wrong interface —
-usually **Tailscale**. Set `LIFX_ADDRESS` to the Pi's LAN IP and `LIFX_BROADCAST` to
-your subnet broadcast (e.g. `192.168.1.255`). If it persists, set `LIFX_LIGHTS` to
-your bulbs' IPs to skip broadcast discovery, or run the worker under `node` instead
-of `bun`.
+means the library's UDP socket hit an error and closed — it never rebinds on its
+own. The worker now detects this and rebuilds the client automatically (with
+backoff), so lights recover within seconds. If the error is constant (often with
+high CPU), broadcast discovery is leaving the wrong interface — usually
+**Tailscale**. Set `LIFX_ADDRESS` to the Pi's LAN IP and `LIFX_BROADCAST` to your
+subnet broadcast (e.g. `192.168.1.255`). If it persists, set `LIFX_LIGHTS` to
+your bulbs' IPs to skip broadcast discovery entirely.
 
 ## Presence ("am I home?")
 

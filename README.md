@@ -14,15 +14,22 @@ sf-agent (Vercel)  --HTTPS+secret-->  Tailscale Funnel  -->  this worker (Pi)  -
 
 ## Job API
 
+All `/jobs` routes are bearer-authed (`Authorization: Bearer $WORKER_SECRET`).
+
 - `GET /health` → `{ "ok": true }`
-- `POST /jobs` (auth: `Authorization: Bearer $WORKER_SECRET`)
+- `POST /jobs` — schedule a job:
   ```json
   { "type": "reminder", "message": "go to the grocery store", "delaySeconds": 3300 }
   ```
   → `{ "id": "...", "fireAt": "2026-06-24T18:55:00.000Z" }`
+  (or `{ "type": "presence", "message": "...", "trigger": "home" | "away" }`)
+- `GET /jobs` → `{ "timed": [...], "presence": [...] }` — everything pending, with ids.
+- `DELETE /jobs/<id>` — cancel a pending timed or presence reminder.
 
-Pending jobs persist to `data/jobs.json`, so they survive a restart. Add new job
-types in the `Job` union and the `fire` switch in `src/jobs.ts`.
+Pending jobs persist to `data/jobs.json`, so they survive a restart. If Telegram
+is unreachable when a reminder fires, delivery retries every minute until it
+lands — a reminder is never silently dropped. Add new job types in the `Job`
+union and the `fire` switch in `src/jobs.ts`.
 
 > Security: the worker only does typed jobs — no arbitrary shell execution — and
 > requires the bearer secret on every call. Keep `WORKER_SECRET` long and private.
@@ -86,12 +93,10 @@ alive without fighting you. It controls LIFX bulbs over the LAN.
   default), `perLight` brightness multipliers / exclusions, drift speed, and the
   scene schedule. Edit it directly or via the API.
 
-It's optional — the worker runs reminders without it. Enable by installing the LAN
-library:
-
-```bash
-bun add lifx-lan-client
-```
+It's optional — the worker runs reminders without it (`lifx-lan-client` loads
+lazily; if it's missing or fails, lighting is simply disabled). A held theme, the
+active scene, and hand-overridden bulbs persist to `data/lighting-state.json`, so
+a worker restart doesn't revert your lighting.
 
 Endpoints (all bearer-authed): `GET /lighting` ·
 `POST /lighting/theme {palette,brightness,drift,white?}` · `POST /lighting/auto` ·

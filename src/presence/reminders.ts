@@ -38,12 +38,33 @@ export async function addPresenceReminder(message: string, trigger: Presence): P
   return r;
 }
 
+export function listPresenceReminders(): PresenceReminder[] {
+  return [...reminders];
+}
+
+export async function cancelPresenceReminder(id: string): Promise<boolean> {
+  const before = reminders.length;
+  reminders = reminders.filter((r) => r.id !== id);
+  if (reminders.length === before) return false;
+  await persist();
+  return true;
+}
+
 export async function firePresence(trigger: Presence): Promise<number> {
   const due = reminders.filter((r) => r.trigger === trigger);
   if (due.length === 0) return 0;
-  reminders = reminders.filter((r) => r.trigger !== trigger);
-  await persist();
   const prefix = trigger === "home" ? "🏠 Welcome home — reminder" : "👋 On your way out — reminder";
-  for (const r of due) await notify(`${prefix}: ${r.message}`).catch((e) => console.error("[presence] notify failed", e));
-  return due.length;
+  // Keep any reminder whose delivery failed — it fires again on the next transition.
+  const failed: PresenceReminder[] = [];
+  for (const r of due) {
+    try {
+      await notify(`${prefix}: ${r.message}`);
+    } catch (e) {
+      console.error("[presence] notify failed — keeping reminder", r.id, e);
+      failed.push(r);
+    }
+  }
+  reminders = reminders.filter((r) => r.trigger !== trigger).concat(failed);
+  await persist();
+  return due.length - failed.length;
 }

@@ -2,11 +2,19 @@
 // bearer secret. Zero runtime deps for the core; lighting adds lifx-lan-client.
 // Runs with `bun src/index.ts`.
 
+import { timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { loadAndArm, scheduleReminder } from "./jobs.js";
+import { cancelJob, listJobs, loadAndArm, scheduleReminder } from "./jobs.js";
 import type { SceneLookInput, TastePatch, ThemeInput } from "./lighting/daemon.js";
 import { startPresence } from "./presence/monitor.js";
-import { addPresenceReminder, firePresence, loadPresenceReminders, type Presence } from "./presence/reminders.js";
+import {
+  addPresenceReminder,
+  cancelPresenceReminder,
+  firePresence,
+  listPresenceReminders,
+  loadPresenceReminders,
+  type Presence,
+} from "./presence/reminders.js";
 
 const PORT = Number(process.env.PORT ?? 8088);
 const SECRET = process.env.WORKER_SECRET;
@@ -18,7 +26,10 @@ let lighting: Lighting | null = null;
 function authorized(req: IncomingMessage): boolean {
   if (!SECRET) return false;
   const auth = req.headers.authorization;
-  return typeof auth === "string" && auth.replace(/^Bearer\s+/i, "").trim() === SECRET;
+  if (typeof auth !== "string") return false;
+  const provided = Buffer.from(auth.replace(/^Bearer\s+/i, "").trim());
+  const expected = Buffer.from(SECRET);
+  return provided.length === expected.length && timingSafeEqual(provided, expected);
 }
 
 async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> {
@@ -90,6 +101,26 @@ const server = createServer(async (req, res) => {
       return send(res, 400, {
         error: "Expected a reminder {message,delaySeconds} or presence {message,trigger:'home'|'away'} job",
       });
+    }
+
+    if (path === "/jobs" && req.method === "GET") {
+      if (!authorized(req)) return send(res, 401, { error: "unauthorized" });
+      return send(res, 200, {
+        timed: listJobs().map((j) => ({
+          id: j.id,
+          message: j.message,
+          fireAt: new Date(j.fireAt).toISOString(),
+        })),
+        presence: listPresenceReminders(),
+      });
+    }
+
+    const jobId = path.match(/^\/jobs\/([^/]+)$/)?.[1];
+    if (jobId && req.method === "DELETE") {
+      if (!authorized(req)) return send(res, 401, { error: "unauthorized" });
+      const id = decodeURIComponent(jobId);
+      const canceled = (await cancelJob(id)) || (await cancelPresenceReminder(id));
+      return canceled ? send(res, 200, { canceled: id }) : send(res, 404, { error: "not found" });
     }
 
     if (path.startsWith("/lighting")) {

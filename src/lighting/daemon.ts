@@ -9,6 +9,8 @@
 //
 // It only drives bulbs it "owns": change one by hand and it backs off until an
 // authoritative scene reclaims it. Color-first; white only when a look asks for it.
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { dirname } from "node:path";
 import { type Color, loadConfig, type Look, type Scene, saveConfig, type TasteConfig } from "./config.js";
 import { Lifx, type LightState } from "./lifx.js";
 
@@ -22,6 +24,45 @@ let config: TasteConfig = await loadConfig();
 let heldTheme: Look | null = null;
 let currentScene: string | null = null;
 const ownership = new Map<string, { commanded: LightState | null; owned: boolean }>();
+
+// Held theme, active scene, and which bulbs were hand-overridden survive a worker
+// restart — otherwise a reboot silently reverts your theme and reclaims bulbs.
+const STATE_FILE = process.env.LIGHTING_STATE_FILE ?? "./data/lighting-state.json";
+interface PersistedState {
+  heldTheme: Look | null;
+  currentScene: string | null;
+  unowned: string[];
+}
+let lastSavedState = "";
+
+async function saveState(): Promise<void> {
+  const state: PersistedState = {
+    heldTheme,
+    currentScene,
+    unowned: [...ownership.entries()].filter(([, o]) => !o.owned).map(([id]) => id),
+  };
+  const json = JSON.stringify(state);
+  if (json === lastSavedState) return; // skip no-op writes (SD-card friendly)
+  lastSavedState = json;
+  try {
+    await mkdir(dirname(STATE_FILE), { recursive: true });
+    await writeFile(STATE_FILE, json);
+  } catch (e) {
+    console.warn("[lighting] state save failed:", (e as Error).message);
+  }
+}
+
+async function loadState(): Promise<void> {
+  try {
+    const state = JSON.parse(await readFile(STATE_FILE, "utf8")) as PersistedState;
+    heldTheme = state.heldTheme ?? null;
+    currentScene = state.currentScene ?? null;
+    for (const id of state.unowned ?? []) ownership.set(id, { commanded: null, owned: false });
+    lastSavedState = JSON.stringify(state);
+  } catch {
+    // no saved state yet
+  }
+}
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n));
@@ -142,10 +183,12 @@ async function tick(): Promise<void> {
     index++;
   }
   currentScene = scene.name;
+  await saveState();
 }
 
 export async function startLighting(): Promise<void> {
   config = await loadConfig();
+  await loadState();
   lifx = new Lifx();
   lifx.start();
   await sleep(4000); // let LAN discovery settle

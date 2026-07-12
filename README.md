@@ -89,6 +89,13 @@ alive without fighting you. It controls LIFX bulbs over the LAN.
 - **Cooperative ownership.** It tracks what it set each bulb to; if you change one
   by hand it backs off that bulb until the next authoritative scene.
 - **Gentle drift.** Owned color bulbs wander hue slowly, skipping avoided colors.
+- **Party mode.** `POST /lighting/party {intensity?,palette?,brightness?}` takes over
+  **every** light (hand-overridden ones included) with fast color changes and
+  occasional white flashes — intensity 1 (chill) to 10 (rave) sets tempo and flash
+  odds; omit the palette for full spectrum (taste hue limits don't apply). It
+  snapshots each light first and `POST /lighting/party/stop` restores that exact
+  state. The snapshot persists (`data/party-state.json`), so a worker restart
+  mid-party resumes the party. Posting `/lighting/party` again retunes it in place.
 - **Taste** lives in `data/lighting.json` (auto-created): `avoidHueRanges` (red by
   default), `perLight` brightness multipliers / exclusions, drift speed, and the
   scene schedule. Edit it directly or via the API.
@@ -100,6 +107,7 @@ a worker restart doesn't revert your lighting.
 
 Endpoints (all bearer-authed): `GET /lighting` ·
 `POST /lighting/theme {palette,brightness,drift,white?}` · `POST /lighting/auto` ·
+`POST /lighting/party {intensity?,palette?,brightness?}` · `POST /lighting/party/stop` ·
 `POST /lighting/scene {scene}` · `POST /lighting/power {on}` · `POST /lighting/flash` ·
 `POST /lighting/enable {enabled}` · `POST /lighting/tune {light?,brightnessScale?,exclude?,avoidRed?}`.
 

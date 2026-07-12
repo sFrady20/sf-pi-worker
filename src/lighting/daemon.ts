@@ -13,6 +13,9 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
 import { type Color, loadConfig, type Look, type Scene, saveConfig, type TasteConfig } from "./config.js";
 import { Lifx, type LightState } from "./lifx.js";
+import * as party from "./party.js";
+
+export type { PartyInput } from "./party.js";
 
 const RED: [number, number][] = [
   [345, 360],
@@ -123,8 +126,11 @@ function matches(a: LightState, b: LightState): boolean {
   return true;
 }
 
+const isExcludedLabel = (label: string) => config.perLight[label]?.exclude === true;
+
 async function tick(): Promise<void> {
   if (!lifx || !config.enabled) return;
+  if (party.isActive()) return; // party owns every bulb until stopped
   const scene = sceneNow(config);
   const sceneChanged = scene.name !== currentScene;
   if (sceneChanged && scene.authoritative) heldTheme = null; // a real time-window takes over
@@ -192,6 +198,7 @@ export async function startLighting(): Promise<void> {
   lifx = new Lifx();
   lifx.start();
   await sleep(4000); // let LAN discovery settle
+  await party.resume(lifx, isExcludedLabel); // a restart mid-party keeps partying
   await tick();
   setInterval(() => void tick(), config.pollSeconds * 1000);
   console.log("[lighting] started");
@@ -200,6 +207,7 @@ export async function startLighting(): Promise<void> {
 export function status(): unknown {
   return {
     enabled: config.enabled,
+    party: party.partyStatus(),
     held: heldTheme ? "custom theme" : null,
     scene: currentScene,
     lights: lifx?.list().map((l) => ({ ...l, owned: ownership.get(l.id)?.owned ?? true })) ?? [],
@@ -277,6 +285,22 @@ export async function setSceneLook(input: SceneLookInput): Promise<void> {
     currentScene = null; // re-apply the updated look now
     await tick();
   }
+}
+
+// Party mode: snapshot everything, take over every bulb, restore on stop.
+// Works even when the ambient system is disabled — it's an explicit command.
+export async function startParty(input: party.PartyInput): Promise<void> {
+  if (!lifx) return;
+  await party.start(lifx, input, isExcludedLabel);
+}
+
+export async function stopParty(): Promise<void> {
+  if (!lifx) return;
+  if (!(await party.stop(lifx))) return;
+  // Rejoin the clock quietly: time that passed mid-party must not read as a
+  // scene boundary, or an authoritative scene would stomp the restored state.
+  currentScene = sceneNow(config).name;
+  await saveState();
 }
 
 export async function resumeAuto(): Promise<void> {

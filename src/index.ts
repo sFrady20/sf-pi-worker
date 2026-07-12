@@ -5,7 +5,7 @@
 import { timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { cancelJob, listJobs, loadAndArm, scheduleReminder } from "./jobs.js";
-import type { SceneLookInput, TastePatch, ThemeInput } from "./lighting/daemon.js";
+import type { PartyInput, SceneLookInput, TastePatch, ThemeInput } from "./lighting/daemon.js";
 import { startPresence } from "./presence/monitor.js";
 import {
   addPresenceReminder,
@@ -73,6 +73,12 @@ async function handleLighting(req: IncomingMessage, res: ServerResponse, path: s
       return send(res, 200, { ok: true });
     case "/lighting/flash":
       bg(l.flash(typeof body.times === "number" ? body.times : 2));
+      return send(res, 200, { ok: true });
+    case "/lighting/party":
+      bg(l.startParty(body as PartyInput));
+      return send(res, 200, { ok: true });
+    case "/lighting/party/stop":
+      bg(l.stopParty());
       return send(res, 200, { ok: true });
     case "/lighting/tune":
       bg(l.tune(body as TastePatch));

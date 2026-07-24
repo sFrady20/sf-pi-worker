@@ -4,6 +4,9 @@
 
 import { timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { checkParking, parkingConfigured, parkingStatus, startWatch, stopWatch, type WatchInput } from "./camera/parking.js";
+import { cameraConfigured, getSnapshot } from "./camera/snapshot.js";
+import { startDiscord } from "./discord/gateway.js";
 import { cancelJob, listJobs, loadAndArm, scheduleReminder } from "./jobs.js";
 import type { PartyInput, SceneLookInput, TastePatch, ThemeInput } from "./lighting/daemon.js";
 import { startPresence } from "./presence/monitor.js";
@@ -88,6 +91,35 @@ async function handleLighting(req: IncomingMessage, res: ServerResponse, path: s
   }
 }
 
+// Camera + parking. A parking check does a snapshot + one vision call, so it
+// can take ~10-30s — callers should use a generous timeout on POST .../check.
+async function handleCamera(req: IncomingMessage, res: ServerResponse, path: string): Promise<void> {
+  if (req.method === "GET" && path === "/camera/snapshot") {
+    if (!cameraConfigured()) return send(res, 503, { error: "camera unavailable (set WYZE_BRIDGE_URL + PARKING_CAMERA)" });
+    const frame = await getSnapshot();
+    res.writeHead(200, { "content-type": "image/jpeg", "content-length": frame.length });
+    res.end(frame);
+    return;
+  }
+  if (req.method === "GET" && path === "/camera/parking") return send(res, 200, parkingStatus());
+  if (!parkingConfigured()) {
+    return send(res, 503, {
+      error: "parking unavailable (set WYZE_BRIDGE_URL + PARKING_CAMERA and ANTHROPIC_API_KEY or AI_GATEWAY_API_KEY)",
+    });
+  }
+  if (req.method === "POST" && path === "/camera/parking/check") {
+    return send(res, 200, await checkParking());
+  }
+  if (req.method === "POST" && path === "/camera/parking/watch") {
+    const body = (await readJson(req)) as WatchInput;
+    return send(res, 200, { watching: true, ...startWatch(body) });
+  }
+  if (req.method === "DELETE" && path === "/camera/parking/watch") {
+    return send(res, 200, { stopped: stopWatch() });
+  }
+  send(res, 404, { error: "not found" });
+}
+
 const server = createServer(async (req, res) => {
   try {
     const path = (req.url ?? "").split("?")[0];
@@ -134,6 +166,11 @@ const server = createServer(async (req, res) => {
       return handleLighting(req, res, path);
     }
 
+    if (path.startsWith("/camera")) {
+      if (!authorized(req)) return send(res, 401, { error: "unauthorized" });
+      return handleCamera(req, res, path);
+    }
+
     send(res, 404, { error: "not found" });
   } catch (err) {
     console.error("[worker] request failed", err);
@@ -170,4 +207,5 @@ server.listen(PORT, () => {
       console.warn("[lighting] disabled:", (err as Error).message);
     }
   })();
+  startDiscord(); // no-ops unless DISCORD_BOT_TOKEN + AGENT_DISCORD_URL are set
 });

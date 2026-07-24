@@ -124,6 +124,64 @@ high CPU), broadcast discovery is leaving the wrong interface — usually
 subnet broadcast (e.g. `192.168.1.255`). If it persists, set `LIFX_LIGHTS` to
 your bulbs' IPs to skip broadcast discovery entirely.
 
+## Parking camera (Wyze via docker-wyze-bridge)
+
+The worker can grab still frames from a Wyze cam and answer "is a parking spot
+open?" with one cheap vision call (Claude Haiku). The camera is reached through
+[docker-wyze-bridge](https://github.com/mrlt8/docker-wyze-bridge) (unofficial;
+needs a free API key/id from [Wyze's developer portal](https://developer-api-console.wyze.com/#/apikey/view)):
+
+```bash
+cd deploy
+WYZE_EMAIL=... WYZE_PASSWORD=... WYZE_API_ID=... WYZE_API_KEY=... \
+  docker compose -f wyze-bridge.compose.yml up -d
+# camera names appear in the bridge UI at http://<pi>:5000
+```
+
+Set `WYZE_BRIDGE_URL`, `PARKING_CAMERA`, a vision key (`ANTHROPIC_API_KEY` or
+`AI_GATEWAY_API_KEY`), and optionally `PARKING_PROMPT` describing which spots
+matter (e.g. "the two curb spots in front of the house").
+
+Endpoints (all bearer-authed):
+
+- `GET /camera/snapshot` → the latest JPEG frame (debugging / on-demand vision).
+- `GET /camera/parking` → `{ configured, last, watch }`.
+- `POST /camera/parking/check` → grab a frame, run the vision model, return
+  `{ open, total, detail, at }`. Takes ~10-30s — use a generous client timeout.
+- `POST /camera/parking/watch { minutes?, intervalSeconds?, stopWhenOpen? }` →
+  re-check on an interval (defaults: 60 min window, every 120s, stop after the
+  first open spot) and **ping Telegram the moment a spot opens**. Checks chain
+  (never overlap); 3 straight failures stop the watch with a Telegram note, and
+  an expired window says nothing opened. Watches are in-memory — a restart ends them.
+- `DELETE /camera/parking/watch` → stop.
+
+The agent's `check_parking` / `watch_parking` tools drive these.
+
+## Discord gateway listener
+
+The agent (serverless) can only receive slash commands; *reading* Discord takes
+a persistent Gateway WebSocket with the privileged **Message Content intent** —
+so this worker holds it (`src/discord/gateway.ts`, zero-dep). It watches server
+messages + DMs (bots skipped), buffers them, and forwards a batch every
+`DISCORD_BATCH_SECONDS` (default 60) to the agent's ingest endpoint, where a
+cheap triage pass files tasks/facts/reminders and pings Steven only when needed.
+
+Setup:
+
+1. Discord Developer Portal → your app → **Bot → Privileged Gateway Intents →
+   enable "Message Content Intent"** (otherwise the gateway closes with 4014 and
+   the worker logs an actionable error).
+2. Set `DISCORD_BOT_TOKEN` (same bot as the agent), `AGENT_DISCORD_URL`
+   (`https://<vercel-app>/eve/v1/discord/ingest`), and `DISCORD_AGENT_SECRET`
+   (= the agent's `DISCORD_INGEST_SECRET`).
+3. Optional: `DISCORD_WATCH_CHANNELS` (comma-separated channel ids) to limit
+   which guild channels are ingested; DMs always pass.
+
+The client handles hello/identify, heartbeats (with zombie detection), resume
+on drops, and exponential backoff. Failed forwards are retried on the next
+flush (buffer capped at 200 messages, oldest dropped). The agent dedupes by
+batch id, so a retry never double-processes.
+
 ## Presence ("am I home?")
 
 Watches one phone's MAC on the LAN with `ip monitor neigh` (event-driven, no

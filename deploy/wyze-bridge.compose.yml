@@ -1,22 +1,40 @@
-# docker-wyze-bridge: local RTSP/snapshot access to Wyze cams (unofficial).
-# Get a free API key/id at https://developer-api-console.wyze.com/#/apikey/view
-# then:  docker compose -f wyze-bridge.compose.yml up -d
-# Snapshots refresh from the RTSP stream every 30s; the worker reads
-# http://<pi>:5000/snapshot/<cam-name>.jpg
+# Wyze camera bridge — the IDisposable fork of docker-wyze-bridge (a Go rewrite;
+# the original mrlt8 project is stalled). Get a free API key/id at
+# https://developer-api-console.wyze.com/#/apikey/view then:
+#
+#   WYZE_EMAIL=... WYZE_PASSWORD=... WYZE_API_ID=... WYZE_API_KEY=... \
+#     docker-compose -f wyze-bridge.compose.yml up -d
+#
+# (Debian ships Compose v2 as the standalone `docker-compose` binary, from the
+#  `docker-compose` package — there is no `docker-compose-v2` package there.)
+#
+# Why the fork: Wyze firmware disabled the TUTK P2P protocol the original bridge
+# depends on, so cameras that still play fine in the Wyze app fail here with
+# "[cam] [-13] IOTC_ER_TIMEOUT" forever. This fork detects repeated TUTK
+# failures and promotes the camera to Wyze's WebRTC path instead.
+#
+# NOT wire-compatible with the mrlt8 image: port 5080 (not 5000), snapshots at
+# /api/snapshot/<cam> (not /snapshot/<cam>.jpg), and renamed env vars.
 services:
   wyze-bridge:
-    image: mrlt8/wyze-bridge:latest
+    image: idisposablegithub365/wyze-bridge:latest
     container_name: wyze-bridge
     restart: unless-stopped
-    ports:
-      - "8554:8554" # RTSP
-      - "5000:5000" # web UI + snapshots
+    # Host networking: P2P/LAN discovery and the WebRTC ICE UDP path both want
+    # direct LAN access, and it saves publishing five separate ports.
+    network_mode: host
+    volumes:
+      - ./config:/config
+      - ./media:/media
     environment:
       - WYZE_EMAIL=${WYZE_EMAIL}
       - WYZE_PASSWORD=${WYZE_PASSWORD}
-      - API_ID=${WYZE_API_ID}
-      - API_KEY=${WYZE_API_KEY}
-      - SNAPSHOT=RTSP30
-      # LAN-only by default. Set WB_AUTH=True and copy the WB_API key from the
-      # web UI into the worker's WYZE_BRIDGE_API_KEY to require auth.
-      - WB_AUTH=False
+      - WYZE_API_ID=${WYZE_API_ID}
+      - WYZE_API_KEY=${WYZE_API_KEY}
+      # This host's LAN IP — required for the WebRTC path to hand out reachable
+      # ICE candidates, which is exactly the path the TUTK fallback lands on.
+      - BRIDGE_IP=192.168.1.88
+      # LAN-only, no web-UI auth (matches the old WB_AUTH=False).
+      - BRIDGE_AUTH=false
+      # Promote a camera to WebRTC after this many consecutive TUTK failures.
+      - TUTK_FALLBACK_THRESHOLD=5

@@ -124,23 +124,45 @@ high CPU), broadcast discovery is leaving the wrong interface — usually
 subnet broadcast (e.g. `192.168.1.255`). If it persists, set `LIFX_LIGHTS` to
 your bulbs' IPs to skip broadcast discovery entirely.
 
-## Parking camera (Wyze via docker-wyze-bridge)
+## Parking camera (Wyze via wyze-bridge)
 
 The worker can grab still frames from a Wyze cam and answer "is a parking spot
 open?" with one cheap vision call (Claude Haiku). The camera is reached through
-[docker-wyze-bridge](https://github.com/mrlt8/docker-wyze-bridge) (unofficial;
-needs a free API key/id from [Wyze's developer portal](https://developer-api-console.wyze.com/#/apikey/view)):
+the [IDisposable fork of docker-wyze-bridge](https://github.com/IDisposable/docker-wyze-bridge)
+(unofficial; needs a free API key/id from [Wyze's developer portal](https://developer-api-console.wyze.com/#/apikey/view)).
+
+**Use the fork, not [mrlt8/docker-wyze-bridge](https://github.com/mrlt8/docker-wyze-bridge).**
+Wyze firmware disabled the TUTK P2P protocol the original depends on, so cameras
+that still play fine in the Wyze app sit in an endless `[-13] IOTC_ER_TIMEOUT`
+retry loop there, and that project is unmaintained. The fork is a Go rewrite that
+promotes a camera to Wyze's WebRTC path after `TUTK_FALLBACK_THRESHOLD` (5)
+consecutive TUTK failures.
+
+This is a separate install step — the worker does **not** bring the bridge up,
+and without it every parking check fails on connection-refused.
 
 ```bash
+sudo apt install -y docker.io docker-compose   # Debian: no docker-compose-v2 package;
+                                               # docker-compose here IS Compose v2 (2.26+)
+sudo usermod -aG docker $USER                  # takes effect on next login
 cd deploy
 WYZE_EMAIL=... WYZE_PASSWORD=... WYZE_API_ID=... WYZE_API_KEY=... \
-  docker compose -f wyze-bridge.compose.yml up -d
-# camera names appear in the bridge UI at http://<pi>:5000
+  docker-compose -f wyze-bridge.compose.yml up -d
 ```
 
-Set `WYZE_BRIDGE_URL`, `PARKING_CAMERA`, a vision key (`ANTHROPIC_API_KEY` or
-`AI_GATEWAY_API_KEY`), and optionally `PARKING_PROMPT` describing which spots
-matter (e.g. "the two curb spots in front of the house").
+Debian ships Compose as a standalone binary, not a CLI plugin, so it's
+`docker-compose` (hyphen) — `docker compose` (space) is not available there.
+
+Set `WYZE_BRIDGE_URL` (**port 5080**), `PARKING_CAMERA`, a vision key
+(`ANTHROPIC_API_KEY` or `AI_GATEWAY_API_KEY`), and optionally `PARKING_PROMPT`
+describing which spots matter (e.g. "the two curb spots in front of the house").
+
+Camera names come from the bridge and use **underscores** (`street_cam`, not
+`street-cam`); list them at `http://<pi>:5080` or in `docker logs wyze-bridge`.
+The worker reads `GET <base>/api/snapshot/<cam>` — no `.jpg` suffix. (The old
+mrlt8 image used `/snapshot/<cam>.jpg` on :5000 with an `?api=` key; the fork
+uses `BRIDGE_AUTH` instead, and we run LAN-only with it off, so
+`WYZE_BRIDGE_API_KEY` is no longer used.)
 
 Endpoints (all bearer-authed):
 

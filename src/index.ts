@@ -96,7 +96,12 @@ async function handleLighting(req: IncomingMessage, res: ServerResponse, path: s
 async function handleCamera(req: IncomingMessage, res: ServerResponse, path: string): Promise<void> {
   if (req.method === "GET" && path === "/camera/snapshot") {
     if (!cameraConfigured()) return send(res, 503, { error: "camera unavailable (set WYZE_BRIDGE_URL + PARKING_CAMERA)" });
-    const frame = await getSnapshot();
+    let frame: Buffer;
+    try {
+      frame = await getSnapshot();
+    } catch (err) {
+      return send(res, 502, { error: `camera: ${(err as Error).message}` });
+    }
     res.writeHead(200, { "content-type": "image/jpeg", "content-length": frame.length });
     res.end(frame);
     return;
@@ -108,7 +113,13 @@ async function handleCamera(req: IncomingMessage, res: ServerResponse, path: str
     });
   }
   if (req.method === "POST" && path === "/camera/parking/check") {
-    return send(res, 200, await checkParking());
+    try {
+      return send(res, 200, await checkParking());
+    } catch (err) {
+      // Upstream failed (bridge frame or vision call) — 502 carrying the reason,
+      // so the agent can tell Steven which half broke instead of guessing.
+      return send(res, 502, { error: (err as Error).message });
+    }
   }
   if (req.method === "POST" && path === "/camera/parking/watch") {
     const body = (await readJson(req)) as WatchInput;
@@ -163,18 +174,22 @@ const server = createServer(async (req, res) => {
 
     if (path.startsWith("/lighting")) {
       if (!authorized(req)) return send(res, 401, { error: "unauthorized" });
-      return handleLighting(req, res, path);
+      // `await` matters: returning the promise unawaited lets a rejection escape
+      // this try/catch and kill the process (it did — see the camera handler).
+      return await handleLighting(req, res, path);
     }
 
     if (path.startsWith("/camera")) {
       if (!authorized(req)) return send(res, 401, { error: "unauthorized" });
-      return handleCamera(req, res, path);
+      return await handleCamera(req, res, path);
     }
 
     send(res, 404, { error: "not found" });
   } catch (err) {
     console.error("[worker] request failed", err);
-    send(res, 500, { error: "internal error" });
+    // Say what actually broke. This worker is private and bearer-gated, and an
+    // opaque error is what made a camera outage look like a dead worker.
+    if (!res.headersSent) send(res, 500, { error: (err as Error).message });
   }
 });
 
@@ -188,6 +203,14 @@ async function notifyAgentPresence(state: Presence): Promise<void> {
     body: JSON.stringify({ state, at: new Date().toISOString() }),
   });
 }
+
+// Last line of defense for an always-on box: one stray rejection used to take
+// the whole worker down — lighting, presence, and the Discord gateway with it.
+// Log it loudly and keep serving. (uncaughtException is deliberately NOT caught;
+// that leaves the process in an unknown state, so let systemd restart it.)
+process.on("unhandledRejection", (reason) => {
+  console.error("[worker] unhandled rejection", reason);
+});
 
 await loadAndArm();
 await loadPresenceReminders();

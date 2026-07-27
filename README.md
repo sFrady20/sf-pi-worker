@@ -157,6 +157,21 @@ Endpoints (all bearer-authed):
 
 The agent's `check_parking` / `watch_parking` tools drive these.
 
+**Troubleshooting.** A camera or vision failure returns `502` with the real
+reason in `{ "error": ... }` — read it before assuming the worker is down. The
+usual cause is docker-wyze-bridge being stopped or logged out, which the Wyze
+phone app does *not* reveal (the app talks to Wyze's cloud; the bridge is a
+separate local login). Check the bridge directly on the Pi:
+
+```bash
+docker ps | grep wyze            # is the container up?
+curl -sS -o /dev/null -w '%{http_code}\n' "$WYZE_BRIDGE_URL/snapshot/$PARKING_CAMERA.jpg?api=$WYZE_BRIDGE_API_KEY"
+docker logs --tail 50 wyze-bridge
+```
+
+An empty-bodied `502` with no worker log line is different: that is Tailscale
+Funnel reporting a dropped connection, i.e. the worker process died mid-request.
+
 ## Discord gateway listener
 
 The agent (serverless) can only receive slash commands; *reading* Discord takes

@@ -6,6 +6,7 @@
   "description": "Always-on home worker for sf-agent: runs long-lived / delayed jobs (e.g. short-fuse reminders) that Vercel's short-lived functions can't.",
   "scripts": {
     "start": "bun src/index.ts",
+    "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

@@ -6,9 +6,27 @@ import { timingSafeEqual } from "node:crypto";
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { checkParking, parkingConfigured, parkingStatus, startWatch, stopWatch, type WatchInput } from "./camera/parking.js";
 import { cameraConfigured, getSnapshot } from "./camera/snapshot.js";
+import {
+  configureCrons,
+  CronInputError,
+  cronsView,
+  loadCrons,
+  runCronNow,
+  setCronTimezone,
+  startCrons,
+  type CronUpdate,
+} from "./crons.js";
 import { startDiscord } from "./discord/gateway.js";
-import { cancelJob, listJobs, loadAndArm, scheduleReminder } from "./jobs.js";
-import type { PartyInput, SceneLookInput, TastePatch, ThemeInput } from "./lighting/daemon.js";
+import { cancelJob, cancelJobByKey, listJobs, loadAndArm, scheduleJob } from "./jobs.js";
+import type {
+  ConfigPatch,
+  PartyInput,
+  SceneLookInput,
+  ScheduleUpdate,
+  SetLightsInput,
+  TastePatch,
+  ThemeInput,
+} from "./lighting/daemon.js";
 import { startPresence } from "./presence/monitor.js";
 import {
   addPresenceReminder,
@@ -46,48 +64,102 @@ function send(res: ServerResponse, status: number, body: unknown): void {
   res.end(JSON.stringify(body));
 }
 
-// Lighting mutations are fire-and-forget: we ack immediately and apply to the
-// bulbs in the background. A wedged LIFX socket can then never hang the agent.
+// A timed job may be placed relatively ("in 90 minutes") or absolutely ("at
+// 16:15 local", sent as an ISO timestamp). Returns null when neither is usable.
+function resolveFireAt(body: Record<string, unknown>): number | null {
+  if (typeof body.delaySeconds === "number" && Number.isFinite(body.delaySeconds)) {
+    return Date.now() + Math.max(0, body.delaySeconds) * 1000;
+  }
+  if (typeof body.fireAt === "string") {
+    const at = Date.parse(body.fireAt);
+    if (!Number.isNaN(at)) return at;
+  }
+  return null;
+}
+
+// Long-running effects are fire-and-forget so a wedged bulb cannot hang the
+// agent. Config, schedule, and direct-control routes await validation/results.
 const bg = (p: Promise<unknown>) => void p.catch((e) => console.warn("[lighting]", (e as Error).message));
 
 async function handleLighting(req: IncomingMessage, res: ServerResponse, path: string): Promise<void> {
   if (!lighting) return send(res, 503, { error: "lighting unavailable" });
-  if (req.method === "GET" && path === "/lighting") return send(res, 200, lighting.status());
+  if (req.method === "GET" && path === "/lighting") return send(res, 200, await lighting.status());
   const l = lighting;
-  const body = await readJson(req);
-  switch (path) {
-    case "/lighting/scene":
-      bg(l.applyScene(body.scene as "morning" | "day" | "evening" | "night"));
-      return send(res, 200, { ok: true });
-    case "/lighting/theme":
-      bg(l.setTheme(body as ThemeInput));
-      return send(res, 200, { ok: true });
-    case "/lighting/auto":
-      bg(l.resumeAuto());
-      return send(res, 200, { ok: true });
-    case "/lighting/scene-look":
-      bg(l.setSceneLook(body as unknown as SceneLookInput));
-      return send(res, 200, { ok: true });
-    case "/lighting/power":
-      bg(l.setAllPower(Boolean(body.on)));
-      return send(res, 200, { ok: true });
-    case "/lighting/enable":
-      bg(l.setEnabled(Boolean(body.enabled)));
-      return send(res, 200, { ok: true });
-    case "/lighting/flash":
-      bg(l.flash(typeof body.times === "number" ? body.times : 2));
-      return send(res, 200, { ok: true });
-    case "/lighting/party":
-      bg(l.startParty(body as PartyInput));
-      return send(res, 200, { ok: true });
-    case "/lighting/party/stop":
-      bg(l.stopParty());
-      return send(res, 200, { ok: true });
-    case "/lighting/tune":
-      bg(l.tune(body as TastePatch));
-      return send(res, 200, { ok: true });
-    default:
-      return send(res, 404, { error: "not found" });
+  let body: Record<string, unknown>;
+  try {
+    const parsed = (await readJson(req)) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return send(res, 400, { error: "JSON body must be an object" });
+    }
+    body = parsed as Record<string, unknown>;
+  } catch {
+    return send(res, 400, { error: "invalid JSON body" });
+  }
+  try {
+    switch (path) {
+      case "/lighting/control":
+        if (req.method !== "POST") return send(res, 405, { error: "method not allowed" });
+        return send(res, 200, await l.setLights(body as SetLightsInput));
+      case "/lighting/schedule":
+        if (req.method !== "PATCH") return send(res, 405, { error: "method not allowed" });
+        await l.configureSchedule(body as ScheduleUpdate);
+        return send(res, 200, { schedule: l.scheduleView() });
+      case "/lighting/config":
+        if (req.method !== "PATCH") return send(res, 405, { error: "method not allowed" });
+        await l.configure(body as ConfigPatch);
+        return send(res, 200, { config: l.configView() });
+      case "/lighting/scene":
+        if (req.method !== "POST") return send(res, 405, { error: "method not allowed" });
+        if (typeof body.scene !== "string") throw new l.LightingInputError("scene must be a name");
+        bg(l.applyScene(body.scene));
+        return send(res, 200, { ok: true, scene: body.scene });
+      case "/lighting/theme":
+        if (req.method !== "POST") return send(res, 405, { error: "method not allowed" });
+        bg(l.setTheme(body as ThemeInput));
+        return send(res, 200, { ok: true });
+      case "/lighting/auto":
+        if (req.method !== "POST") return send(res, 405, { error: "method not allowed" });
+        bg(l.resumeAuto());
+        return send(res, 200, { ok: true });
+      case "/lighting/scene-look":
+        if (req.method !== "POST") return send(res, 405, { error: "method not allowed" });
+        bg(l.setSceneLook(body as unknown as SceneLookInput));
+        return send(res, 200, { ok: true });
+      case "/lighting/power":
+        if (req.method !== "POST") return send(res, 405, { error: "method not allowed" });
+        if (typeof body.on !== "boolean") throw new l.LightingInputError("on must be a boolean");
+        bg(l.setAllPower(body.on));
+        return send(res, 200, { ok: true, on: body.on });
+      case "/lighting/enable":
+        if (req.method !== "POST") return send(res, 405, { error: "method not allowed" });
+        if (typeof body.enabled !== "boolean") throw new l.LightingInputError("enabled must be a boolean");
+        bg(l.setEnabled(body.enabled));
+        return send(res, 200, { ok: true, enabled: body.enabled });
+      case "/lighting/flash":
+        if (req.method !== "POST") return send(res, 405, { error: "method not allowed" });
+        if (body.times !== undefined && (typeof body.times !== "number" || !Number.isInteger(body.times) || body.times < 1 || body.times > 10)) {
+          throw new l.LightingInputError("times must be an integer from 1 to 10");
+        }
+        bg(l.flash(typeof body.times === "number" ? body.times : 2));
+        return send(res, 200, { ok: true });
+      case "/lighting/party":
+        if (req.method !== "POST") return send(res, 405, { error: "method not allowed" });
+        bg(l.startParty(body as PartyInput));
+        return send(res, 200, { ok: true });
+      case "/lighting/party/stop":
+        if (req.method !== "POST") return send(res, 405, { error: "method not allowed" });
+        bg(l.stopParty());
+        return send(res, 200, { ok: true });
+      case "/lighting/tune":
+        if (req.method !== "POST") return send(res, 405, { error: "method not allowed" });
+        bg(l.tune(body as TastePatch));
+        return send(res, 200, { ok: true });
+      default:
+        return send(res, 404, { error: "not found" });
+    }
+  } catch (error) {
+    if (error instanceof l.LightingInputError) return send(res, 400, { error: error.message });
+    throw error;
   }
 }
 
@@ -139,28 +211,49 @@ const server = createServer(async (req, res) => {
     if (path === "/jobs" && req.method === "POST") {
       if (!authorized(req)) return send(res, 401, { error: "unauthorized" });
       const body = await readJson(req);
-      if (body.type === "reminder" && typeof body.message === "string" && typeof body.delaySeconds === "number") {
-        const job = await scheduleReminder(body.message, body.delaySeconds);
-        return send(res, 200, { id: job.id, fireAt: new Date(job.fireAt).toISOString() });
+      // Timed: a reminder (fixed text) or a wake (the agent runs a real turn).
+      // Either accepts a relative delaySeconds or an absolute ISO fireAt.
+      if ((body.type === "reminder" || body.type === "wake") && typeof body.message === "string") {
+        const fireAt = resolveFireAt(body);
+        if (fireAt === null) {
+          return send(res, 400, { error: "provide delaySeconds (number) or fireAt (ISO timestamp)" });
+        }
+        const job = await scheduleJob({
+          type: body.type,
+          message: body.message,
+          fireAt,
+          key: typeof body.key === "string" ? body.key : undefined,
+          source: typeof body.source === "string" ? body.source : undefined,
+        });
+        return send(res, 200, { id: job.id, type: job.type, fireAt: new Date(job.fireAt).toISOString() });
       }
       if (body.type === "presence" && typeof body.message === "string" && (body.trigger === "home" || body.trigger === "away")) {
-        const r = await addPresenceReminder(body.message, body.trigger as Presence);
-        return send(res, 200, { id: r.id, trigger: r.trigger });
+        const kind = body.kind === "wake" ? "wake" : "notify";
+        const r = await addPresenceReminder(body.message, body.trigger as Presence, kind);
+        return send(res, 200, { id: r.id, trigger: r.trigger, kind: r.kind });
       }
       return send(res, 400, {
-        error: "Expected a reminder {message,delaySeconds} or presence {message,trigger:'home'|'away'} job",
+        error:
+          "Expected {type:'reminder'|'wake', message, delaySeconds|fireAt} or " +
+          "{type:'presence', message, trigger:'home'|'away', kind?}",
       });
     }
 
+    // Everything on the agent's clock in one call: pending one-shots, presence
+    // triggers, and the recurring entries it owns.
     if (path === "/jobs" && req.method === "GET") {
       if (!authorized(req)) return send(res, 401, { error: "unauthorized" });
       return send(res, 200, {
         timed: listJobs().map((j) => ({
           id: j.id,
+          type: j.type,
           message: j.message,
           fireAt: new Date(j.fireAt).toISOString(),
+          key: j.key,
+          source: j.source,
         })),
         presence: listPresenceReminders(),
+        recurring: cronsView(),
       });
     }
 
@@ -168,8 +261,35 @@ const server = createServer(async (req, res) => {
     if (jobId && req.method === "DELETE") {
       if (!authorized(req)) return send(res, 401, { error: "unauthorized" });
       const id = decodeURIComponent(jobId);
-      const canceled = (await cancelJob(id)) || (await cancelPresenceReminder(id));
+      const canceled =
+        (await cancelJob(id)) || (await cancelPresenceReminder(id)) || (await cancelJobByKey(id));
       return canceled ? send(res, 200, { canceled: id }) : send(res, 404, { error: "not found" });
+    }
+
+    if (path.startsWith("/crons")) {
+      if (!authorized(req)) return send(res, 401, { error: "unauthorized" });
+      try {
+        if (req.method === "GET" && path === "/crons") return send(res, 200, cronsView());
+        if (req.method === "PATCH" && path === "/crons") {
+          const body = await readJson(req);
+          if (typeof body.timezone === "string") await setCronTimezone(body.timezone);
+          if (body.replace !== undefined || body.remove !== undefined || body.upsert !== undefined) {
+            await configureCrons(body as CronUpdate);
+          } else if (typeof body.timezone !== "string") {
+            throw new CronInputError("provide replace, remove, upsert, or timezone");
+          }
+          return send(res, 200, cronsView());
+        }
+        const runName = path.match(/^\/crons\/([^/]+)\/run$/)?.[1];
+        if (runName && req.method === "POST") {
+          const ran = await runCronNow(decodeURIComponent(runName));
+          return ran ? send(res, 200, { ran: decodeURIComponent(runName) }) : send(res, 404, { error: "not found" });
+        }
+        return send(res, 404, { error: "not found" });
+      } catch (error) {
+        if (error instanceof CronInputError) return send(res, 400, { error: error.message });
+        throw error;
+      }
     }
 
     if (path.startsWith("/lighting")) {
@@ -213,6 +333,8 @@ process.on("unhandledRejection", (reason) => {
 });
 
 await loadAndArm();
+await loadCrons();
+startCrons();
 await loadPresenceReminders();
 await startPresence(async (state) => {
   console.log("[presence]", state);
@@ -224,8 +346,9 @@ server.listen(PORT, () => {
   console.log(`[worker] listening on :${PORT}`);
   void (async () => {
     try {
-      lighting = await import("./lighting/daemon.js");
-      await lighting.startLighting();
+      const loadedLighting = await import("./lighting/daemon.js");
+      await loadedLighting.startLighting();
+      lighting = loadedLighting;
     } catch (err) {
       console.warn("[lighting] disabled:", (err as Error).message);
     }

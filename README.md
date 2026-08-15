@@ -2,34 +2,67 @@
 
 An always-on home worker for [sf-agent](https://github.com/sFrady20/sf-agent). It
 runs long-lived and delayed jobs that the agent's serverless functions (on Vercel)
-can't hold — starting with short-fuse reminders ("remind me in 55 minutes…").
+can't hold, and it **holds the agent's clock** — every recurring and scheduled
+moment the agent owns.
 
 The agent reaches it over **Tailscale Funnel** (a stable public HTTPS URL that
-tunnels to this worker), guarded by a shared secret. The worker does the waiting
-and pings you on Telegram when a job fires.
+tunnels to this worker), guarded by a shared secret. The worker does the waiting;
+when a moment arrives it either pings Telegram or calls the agent back to run a
+full turn.
 
 ```
 sf-agent (Vercel)  --HTTPS+secret-->  Tailscale Funnel  -->  this worker (Pi)  -->  Telegram
+       ^                                                            |
+       +-------------------- POST /eve/v1/wake ---------------------+
 ```
+
+## The clock
+
+Two shapes, both durable across a reboot.
+
+**One-shot jobs** — fire once at a moment:
+
+- `reminder` sends its text to Telegram verbatim.
+- `wake` POSTs its prompt to the agent's `AGENT_WAKE_URL`, which runs a real agent
+  turn with every tool and all of memory. The agent decides *then* what to do, and
+  most wakes are expected to end without a message. If `AGENT_WAKE_URL` /
+  `AGENT_WAKE_SECRET` aren't set, a wake degrades to a plain Telegram message
+  rather than being lost.
+
+**Recurring entries** (`src/crons.ts`, persisted to `data/crons.json`) — named,
+minute-precise local times on chosen weekdays, edited by name. A box that has
+never had a crons file is seeded once with a morning brief and an evening review;
+after that the list belongs to the agent, and a deliberately emptied schedule
+stays empty. A tick runs every 20s and will still fire an entry it missed by up to
+10 minutes, so a busy box or a restart doesn't skip the day.
 
 ## Job API
 
-All `/jobs` routes are bearer-authed (`Authorization: Bearer $WORKER_SECRET`).
+All routes below are bearer-authed (`Authorization: Bearer $WORKER_SECRET`).
 
 - `GET /health` → `{ "ok": true }`
-- `POST /jobs` — schedule a job:
+- `POST /jobs` — schedule a one-shot. `delaySeconds` (relative) or `fireAt` (ISO):
   ```json
   { "type": "reminder", "message": "go to the grocery store", "delaySeconds": 3300 }
+  { "type": "wake", "message": "Check whether the permit reply came in.", "fireAt": "2026-08-16T13:00:00Z", "key": "permit-followup" }
+  { "type": "presence", "message": "take out the trash", "trigger": "home", "kind": "notify" }
   ```
-  → `{ "id": "...", "fireAt": "2026-06-24T18:55:00.000Z" }`
-  (or `{ "type": "presence", "message": "...", "trigger": "home" | "away" }`)
-- `GET /jobs` → `{ "timed": [...], "presence": [...] }` — everything pending, with ids.
-- `DELETE /jobs/<id>` — cancel a pending timed or presence reminder.
+  → `{ "id": "...", "type": "wake", "fireAt": "..." }`. An optional `key` makes the
+  job idempotent: re-posting the same key re-times the pending job instead of
+  stacking a duplicate.
+- `GET /jobs` → `{ "timed": [...], "presence": [...], "recurring": {...} }` —
+  everything on the clock, with ids and next runs.
+- `DELETE /jobs/<id>` — cancel a pending one-shot by id, or by its `key`.
+- `GET /crons` → the recurring entries with each one's next run.
+- `PATCH /crons` — `{ replace?, remove?, upsert?, timezone? }`, applied in that
+  order. Upsert patches by name (case-insensitive) or creates.
+- `POST /crons/<name>/run` — fire one now, without waiting for its time.
 
-Pending jobs persist to `data/jobs.json`, so they survive a restart. If Telegram
-is unreachable when a reminder fires, delivery retries every minute until it
-lands — a reminder is never silently dropped. Add new job types in the `Job`
-union and the `fire` switch in `src/jobs.ts`.
+Pending jobs persist to `data/jobs.json`, so they survive a restart. If delivery
+fails (Telegram or the agent unreachable) it retries every minute — a duplicate
+beats a loss — and is abandoned only once it's hours stale, since by then it isn't
+the moment anymore. Add new job types in the `JobType` union and the `fire` switch
+in `src/jobs.ts`.
 
 > Security: the worker only does typed jobs — no arbitrary shell execution — and
 > requires the bearer secret on every call. Keep `WORKER_SECRET` long and private.
@@ -79,37 +112,64 @@ sudo systemctl daemon-reload && sudo systemctl enable --now sf-pi-worker
 An optional cooperative lighting daemon (`src/lighting/`) that makes the lab feel
 alive without fighting you. It controls LIFX bulbs over the LAN.
 
-- **Time-of-day scenes** (morning / day / evening / night), all color-first; night
-  is a dim calming indigo, not off. Morning and evening are *authoritative* — they
-  may turn lights on/off and reclaim bulbs you'd changed by hand. Daytime is
-  cooperative.
+- **Editable automation.** The default morning / day / evening / night entries are
+  only a starting point. Entries can have arbitrary names, minute-precise local
+  start times, selected weekdays, and `on` / `off` / `leave` power behavior.
+  Reclaiming bulbs changed by hand and interrupting a held theme are independent
+  per-entry choices, so an energy-saving off window does not require disabling the
+  ambient system. A strict off window sets `power: "off"`, `reclaim: true`, and
+  `interruptTheme: true`. Editing the active entry updates managed bulbs without
+  pretending a clock boundary occurred; call `/lighting/auto` afterward when its
+  reclaim/interruption policy should also apply immediately.
 - **Held themes.** An explicit theme (designed by the agent, or a named scene
-  applied on demand) *holds* — the schedule won't revert it — until you resume auto,
-  change a bulb by hand, or the next authoritative time-window.
-- **Cooperative ownership.** It tracks what it set each bulb to; if you change one
-  by hand it backs off that bulb until the next authoritative scene.
+  applied on demand) *holds* — the schedule won't revert it — until you resume auto
+  or an entry configured to interrupt the theme begins. A bulb changed by hand
+  leaves the theme individually without ending it for the other bulbs.
+- **Cooperative ownership.** It tracks what it set each bulb to; a physical or
+  agent-requested hold makes it back off that bulb until a schedule entry configured
+  to reclaim it begins, or the agent explicitly resumes automation.
 - **Gentle drift.** Owned color bulbs wander hue slowly, skipping avoided colors.
 - **Party mode.** `POST /lighting/party {intensity?,palette?,brightness?}` takes over
-  **every** light (hand-overridden ones included) with fast color changes and
-  occasional white flashes — intensity 1 (chill) to 10 (rave) sets tempo and flash
-  odds; omit the palette for full spectrum (taste hue limits don't apply). It
-  snapshots each light first and `POST /lighting/party/stop` restores that exact
-  state. The snapshot persists (`data/party-state.json`), so a worker restart
-  mid-party resumes the party. Posting `/lighting/party` again retunes it in place.
-- **Taste** lives in `data/lighting.json` (auto-created): `avoidHueRanges` (red by
-  default), `perLight` brightness multipliers / exclusions, drift speed, and the
-  scene schedule. Edit it directly or via the API.
+  every reachable, non-excluded light snapshotted at startup (hand-overridden ones
+  included) with fast color changes and occasional white flashes. Intensity 1
+  (chill) to 10 (rave) sets tempo and flash odds. Omit the initial palette for full
+  spectrum; omission while retuning preserves the current palette, while `null`
+  explicitly switches to full spectrum. `POST /lighting/party/stop` drains in-flight
+  flashes and restores the exact snapshot. The snapshot persists
+  (`data/party-state.json`), so a restart resumes either the party or an incomplete
+  restoration safely.
+- **Configuration** lives in `data/lighting.json` (auto-created): `avoidHueRanges`
+  (red by default), per-light brightness multipliers / exclusions, drift speed,
+  timezone, and the full schedule. Every field is readable and editable through
+  the API; legacy `startHour` / `authoritative` configs migrate when loaded.
+  If the persisted file cannot be validated, automation fails safe to disabled
+  and status exposes the error/raw value. Repair starts with a complete schedule
+  replacement, preventing a small patch from overwriting the old custom schedule.
 
 It's optional — the worker runs reminders without it (`lifx-lan-client` loads
 lazily; if it's missing or fails, lighting is simply disabled). A held theme, the
 active scene, and hand-overridden bulbs persist to `data/lighting-state.json`, so
-a worker restart doesn't revert your lighting.
+a worker restart doesn't revert your lighting. If that runtime-state file is
+invalid, automatic control pauses instead of guessing; `GET /lighting` reports
+`mode: "recovery_paused"` and a `stateIssue`, and an explicit auto resume or new
+theme acknowledges recovery.
 
-Endpoints (all bearer-authed): `GET /lighting` ·
-`POST /lighting/theme {palette,brightness,drift,white?}` · `POST /lighting/auto` ·
-`POST /lighting/party {intensity?,palette?,brightness?}` · `POST /lighting/party/stop` ·
-`POST /lighting/scene {scene}` · `POST /lighting/power {on}` · `POST /lighting/flash` ·
-`POST /lighting/enable {enabled}` · `POST /lighting/tune {light?,brightnessScale?,exclude?,avoidRed?}`.
+Primary endpoints (all bearer-authed):
+
+- `GET /lighting` — live bulb states, active mode/effect, schedule, and config.
+- `POST /lighting/control` — target every bulb or selected labels/ids; set raw
+  power/HSBK/transition state and choose whether the result holds or follows auto.
+- `PATCH /lighting/schedule` — replace, upsert, or remove validated schedule entries.
+- `PATCH /lighting/config` — daemon timing/taste and per-light configuration.
+- `POST /lighting/theme` / `POST /lighting/auto` — hold a (possibly drifting) look
+  or explicitly resume automatic control.
+- `POST /lighting/party` / `POST /lighting/party/stop` — start, retune, and exactly
+  restore party mode; use `palette: null` to retune to full spectrum.
+- `POST /lighting/scene` / `POST /lighting/flash` — apply a saved entry as a held
+  theme or run a notification pulse.
+
+The older `/lighting/scene-look`, `/lighting/power`, `/lighting/enable`, and
+`/lighting/tune` mutation routes remain as compatibility adapters.
 
 > `src/lighting/lifx.ts` wraps the LAN library — verify its calls against your
 > installed `lifx-lan-client` version, and add per-light tuning once you see your
